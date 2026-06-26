@@ -57,16 +57,6 @@ static void blit(void) {
     }
 }
 
-static void display_message(const char* message) {
-    if (pax_buf_get_width(&fb) > 0) {
-        pax_background(&fb, BLACK);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, message);
-        blit();
-    } else {
-        ESP_LOGI(TAG, "Message: %s", message);
-    }
-}
-
 #define GPS_UART_PORT UART_NUM_1
 #define GPS_UART_BAUD 9600
 #define GPS_BUF_SIZE  1024
@@ -101,97 +91,198 @@ typedef struct {
 
 static gps_data_t gps_data = {0};
 
+static pax_col_t sat_signal_color(float snr) {
+    if (isnan(snr) || snr <= 0) return 0xFF555555;  // no signal data
+    if (snr >= 35) return 0xFF00DD55;               // good
+    if (snr >= 20) return 0xFFFFCC00;               // medium
+    return 0xFFFF6600;                              // weak
+}
+
 // Sky plot: center (cx,cy), radius r. North=up, azimuth clockwise.
 static void draw_sky_plot(float cx, float cy, float r) {
-    // Elevation rings at 30° and 60° (dim)
-    pax_outline_circle(&fb, 0xFF404040, cx, cy, r * 2.0f / 3.0f);
-    pax_outline_circle(&fb, 0xFF404040, cx, cy, r / 3.0f);
-    // Crosshairs (dim)
-    pax_simple_line(&fb, 0xFF404040, cx - r, cy, cx + r, cy);
-    pax_simple_line(&fb, 0xFF404040, cx, cy - r, cx, cy + r);
+    // Dark filled background
+    pax_draw_circle(&fb, 0xFF111111, cx, cy, r);
+
+    // Dim elevation rings and crosshairs
+    pax_outline_circle(&fb, 0xFF2A2A2A, cx, cy, r * 2.0f / 3.0f);
+    pax_outline_circle(&fb, 0xFF2A2A2A, cx, cy, r / 3.0f);
+    pax_simple_line(&fb, 0xFF222222, cx - r, cy, cx + r, cy);
+    pax_simple_line(&fb, 0xFF222222, cx, cy - r, cx, cy + r);
+
     // Horizon circle
-    pax_outline_circle(&fb, WHITE, cx, cy, r);
-    // Cardinal labels
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - 3.0f,  cy - r - 11.0f, "N");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - 3.0f,  cy + r + 2.0f,  "S");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx + r + 2.0f, cy - 4.5f,   "E");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - r - 8.0f, cy - 4.5f,   "W");
-    // Satellite dots + PRN labels
+    pax_outline_circle(&fb, 0xFF666666, cx, cy, r);
+
+    // Elevation ring labels (30° and 60°)
+    float lfs = r * 0.075f;
+    pax_draw_text(&fb, 0xFF444444, pax_font_sky_mono, lfs, cx + r * 2.0f / 3.0f + 3.0f, cy - lfs * 0.5f, "30");
+    pax_draw_text(&fb, 0xFF444444, pax_font_sky_mono, lfs, cx + r / 3.0f + 3.0f, cy - lfs * 0.5f, "60");
+
+    // Cardinal labels, sized and positioned relative to the plot radius
+    float     cfs = r * 0.09f;
+    pax_vec2f chs = pax_text_size(pax_font_sky_mono, cfs, "N");
+    pax_draw_text(&fb, 0xFFCCCCCC, pax_font_sky_mono, cfs, cx - chs.x * 0.5f, cy - r - chs.y - 3.0f, "N");
+    pax_draw_text(&fb, 0xFFCCCCCC, pax_font_sky_mono, cfs, cx - chs.x * 0.5f, cy + r + 4.0f, "S");
+    pax_draw_text(&fb, 0xFFCCCCCC, pax_font_sky_mono, cfs, cx + r + 5.0f, cy - chs.y * 0.5f, "E");
+    pax_draw_text(&fb, 0xFFCCCCCC, pax_font_sky_mono, cfs, cx - r - chs.x - 5.0f, cy - chs.y * 0.5f, "W");
+
+    // Satellite dots + PRN labels, scaled to plot size
+    float dot_r = r * 0.045f;
+    float pfs   = r * 0.065f;
     for (int i = 0; i < gps_data.sat_count; i++) {
         sat_info_t* s      = &gps_data.sats[i];
         float       az     = s->azimuth * DEG2RAD;
         float       plot_r = r * (1.0f - (float)s->elevation / 90.0f);
         float       sx     = cx + plot_r * sinf(az);
         float       sy     = cy - plot_r * cosf(az);
-        pax_draw_circle(&fb, WHITE, sx, sy, 3.5f);
+        pax_col_t   col    = sat_signal_color(s->snr);
+        pax_draw_circle(&fb, col, sx, sy, dot_r);
         char prn_str[5];
         snprintf(prn_str, sizeof(prn_str), "%d", s->prn);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, sx + 4.5f, sy - 4.5f, prn_str);
+        pax_draw_text(&fb, col, pax_font_sky_mono, pfs, sx + dot_r + 1.0f, sy - pfs * 0.5f, prn_str);
     }
 }
 
 static void display_gps_data(void) {
     if (pax_buf_get_width(&fb) == 0) return;
 
-    char text[32];
-    pax_background(&fb, BLACK);
+    float w = pax_buf_get_widthf(&fb);
+    float h = pax_buf_get_heightf(&fb);
 
-    // Left column: text info (fits within ~175 px)
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 4, "GPS Receiver");
+    // Left panel: 45% of width; sky plot fills the right 55%
+    float panel_w = floorf(w * 0.45f);
+    float cx      = panel_w + (w - panel_w) * 0.5f;
+    float cy      = h * 0.5f;
+    float r       = fminf((w - panel_w) * 0.5f, h * 0.5f) - 44.0f;
+
+    char text[48];
+    pax_background(&fb, 0xFF000000);
+
+    // Title
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, 26, 10, 10, "GPS Receiver");
+
+    // Fix status: coloured dot + label
     if (gps_data.has_fix) {
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 22, "FIX OK");
+        pax_draw_circle(&fb, 0xFF00DD55, 19, 52, 7);
+        pax_draw_text(&fb, 0xFF00DD55, pax_font_sky_mono, 18, 32, 43, "FIX OK");
     } else {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 22, "NO FIX");
+        pax_draw_circle(&fb, 0xFFFF4444, 19, 52, 7);
+        pax_draw_text(&fb, 0xFFFF4444, pax_font_sky_mono, 18, 32, 43, "NO FIX");
     }
 
+    // Shared layout constants for label/value rows
+    float lx = 10, vx = 155, lfs = 18, lh = 26, y = 82;
+
+    // Section: time & date
+    pax_simple_line(&fb, 0xFF333333, 0, y, panel_w, y);
+    y += 12;
+
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Time");
     if (gps_data.has_time) {
-        snprintf(text, sizeof(text), "%02d:%02d:%02d UTC",
-                 gps_data.time.hours, gps_data.time.minutes, gps_data.time.seconds);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, text);
-        snprintf(text, sizeof(text), "%02d/%02d/%04d",
-                 gps_data.date.day, gps_data.date.month, gps_data.date.year);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 58, text);
+        snprintf(text, sizeof(text), "%02d:%02d:%02d UTC", gps_data.time.hours, gps_data.time.minutes,
+                 gps_data.time.seconds);
     } else {
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, "--:--:--");
+        snprintf(text, sizeof(text), "--:--:--");
     }
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
+    y += lh;
 
-    if (gps_data.has_fix) {
-        snprintf(text, sizeof(text), "Lat:%+.6f", gps_data.latitude);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 76, text);
-        snprintf(text, sizeof(text), "Lon:%+.6f", gps_data.longitude);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 94, text);
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Date");
+    if (gps_data.has_time) {
+        snprintf(text, sizeof(text), "%02d / %02d / %04d", gps_data.date.day, gps_data.date.month, gps_data.date.year);
     } else {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 76, "No position fix");
+        snprintf(text, sizeof(text), "--/--/----");
     }
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
 
-    snprintf(text, sizeof(text), "Alt:%.1f%c",
-             gps_data.altitude, gps_data.altitude_units ? gps_data.altitude_units : 'm');
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 112, text);
+    // Section: position
+    y += lh + 10;
+    pax_simple_line(&fb, 0xFF333333, 0, y, panel_w, y);
+    y += 12;
 
-    snprintf(text, sizeof(text), "Sats:%d", gps_data.satellites);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 130, text);
-
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Latitude");
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y + lh, "Longitude");
     if (gps_data.has_fix) {
-        snprintf(text, sizeof(text), "Spd:%.1fkn", gps_data.speed_knots);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 148, text);
-        snprintf(text, sizeof(text), "Crs:%.1fdeg", gps_data.course);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 166, text);
+        snprintf(text, sizeof(text), "%+.6f", gps_data.latitude);
+        pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
+        snprintf(text, sizeof(text), "%+.6f", gps_data.longitude);
+        pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y + lh, text);
+    } else {
+        pax_draw_text(&fb, 0xFF555555, pax_font_sky_mono, lfs, vx, y, "--");
+        pax_draw_text(&fb, 0xFF555555, pax_font_sky_mono, lfs, vx, y + lh, "--");
     }
 
+    // Section: altitude & satellites
+    y += 2 * lh + 10;
+    pax_simple_line(&fb, 0xFF333333, 0, y, panel_w, y);
+    y += 12;
+
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Altitude");
+    snprintf(text, sizeof(text), "%.1f %c", gps_data.altitude, gps_data.altitude_units ? gps_data.altitude_units : 'm');
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
+    y += lh;
+
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Satellites");
+    snprintf(text, sizeof(text), "%d", gps_data.satellites);
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
+
+    // Section: speed & course
+    y += lh + 10;
+    pax_simple_line(&fb, 0xFF333333, 0, y, panel_w, y);
+    y += 12;
+
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Speed");
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y + lh, "Course");
+    if (gps_data.has_fix) {
+        snprintf(text, sizeof(text), "%.1f kn", gps_data.speed_knots);
+        pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y, text);
+        snprintf(text, sizeof(text), "%.1f deg", gps_data.course);
+        pax_draw_text(&fb, 0xFFFFFFFF, pax_font_sky_mono, lfs, vx, y + lh, text);
+    } else {
+        pax_draw_text(&fb, 0xFF555555, pax_font_sky_mono, lfs, vx, y, "--");
+        pax_draw_text(&fb, 0xFF555555, pax_font_sky_mono, lfs, vx, y + lh, "--");
+    }
+
+    // Section: fix quality
+    y += 2 * lh + 10;
+    pax_simple_line(&fb, 0xFF333333, 0, y, panel_w, y);
+    y += 12;
+
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Fix type");
     const char* fix_str;
+    pax_col_t   fix_col;
     switch (gps_data.fix_type) {
-        case MINMEA_GPGSA_FIX_2D: fix_str = "2D"; break;
-        case MINMEA_GPGSA_FIX_3D: fix_str = "3D"; break;
-        default:                  fix_str = "--"; break;
+        case MINMEA_GPGSA_FIX_2D:
+            fix_str = "2D";
+            fix_col = 0xFFFFCC00;
+            break;
+        case MINMEA_GPGSA_FIX_3D:
+            fix_str = "3D";
+            fix_col = 0xFF00DD55;
+            break;
+        default:
+            fix_str = "--";
+            fix_col = 0xFF555555;
+            break;
     }
-    snprintf(text, sizeof(text), "Fix:%s HDOP:%.1f", fix_str, gps_data.hdop);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 184, text);
+    pax_draw_text(&fb, fix_col, pax_font_sky_mono, lfs, vx, y, fix_str);
+    y += lh;
 
-    // Vertical divider
-    pax_simple_line(&fb, 0xFF404040, 175.0f, 0.0f, 175.0f, (float)pax_buf_get_height(&fb));
+    pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "HDOP");
+    pax_col_t hdop_col;
+    if (isnan(gps_data.hdop) || gps_data.hdop <= 0.0f) {
+        snprintf(text, sizeof(text), "--");
+        hdop_col = 0xFF555555;
+    } else {
+        snprintf(text, sizeof(text), "%.1f", gps_data.hdop);
+        hdop_col = gps_data.hdop < 2.0f ? 0xFF00DD55 : gps_data.hdop < 5.0f ? 0xFFFFCC00 : 0xFFFF4444;
+    }
+    pax_draw_text(&fb, hdop_col, pax_font_sky_mono, lfs, vx, y, text);
 
-    // Sky plot: right half, vertically centred
-    draw_sky_plot(252.0f, 120.0f, 62.0f);
+    // Vertical divider between panels
+    pax_simple_line(&fb, 0xFF333333, panel_w, 0, panel_w, h);
+
+    // Sky plot centred in the right panel
+    draw_sky_plot(cx, cy, r);
 
     blit();
 }
