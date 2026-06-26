@@ -9,6 +9,7 @@
 #include "custom_certificates.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "minmea.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
@@ -70,7 +71,7 @@ static void display_message(const char* message) {
 #define GPS_BUF_SIZE  1024
 
 static void gps_task(void* arg) {
-    uint8_t* buf     = malloc(GPS_BUF_SIZE);
+    uint8_t* buf      = malloc(GPS_BUF_SIZE);
     char     line[256];
     int      line_pos = 0;
 
@@ -81,7 +82,59 @@ static void gps_task(void* arg) {
             if (c == '\n') {
                 line[line_pos] = '\0';
                 if (line_pos > 0) {
-                    printf("%s\n", line);
+                    switch (minmea_sentence_id(line, false)) {
+                        case MINMEA_SENTENCE_RMC: {
+                            struct minmea_sentence_rmc frame;
+                            if (minmea_parse_rmc(&frame, line)) {
+                                printf("RMC: %02d:%02d:%02d fix=%s lat=%.6f lon=%.6f speed=%.1fkn course=%.1f\n",
+                                       frame.time.hours, frame.time.minutes, frame.time.seconds,
+                                       frame.valid ? "valid" : "invalid",
+                                       minmea_tocoord(&frame.latitude),
+                                       minmea_tocoord(&frame.longitude),
+                                       minmea_tofloat(&frame.speed),
+                                       minmea_tofloat(&frame.course));
+                            }
+                            break;
+                        }
+                        case MINMEA_SENTENCE_GGA: {
+                            struct minmea_sentence_gga frame;
+                            if (minmea_parse_gga(&frame, line)) {
+                                printf("GGA: %02d:%02d:%02d lat=%.6f lon=%.6f quality=%d sats=%d alt=%.1f%c\n",
+                                       frame.time.hours, frame.time.minutes, frame.time.seconds,
+                                       minmea_tocoord(&frame.latitude),
+                                       minmea_tocoord(&frame.longitude),
+                                       frame.fix_quality,
+                                       frame.satellites_tracked,
+                                       minmea_tofloat(&frame.altitude),
+                                       frame.altitude_units);
+                            }
+                            break;
+                        }
+                        case MINMEA_SENTENCE_GSA: {
+                            struct minmea_sentence_gsa frame;
+                            if (minmea_parse_gsa(&frame, line)) {
+                                printf("GSA: fix=%d pdop=%.1f hdop=%.1f vdop=%.1f\n",
+                                       frame.fix_type,
+                                       minmea_tofloat(&frame.pdop),
+                                       minmea_tofloat(&frame.hdop),
+                                       minmea_tofloat(&frame.vdop));
+                            }
+                            break;
+                        }
+                        case MINMEA_SENTENCE_GSV: {
+                            struct minmea_sentence_gsv frame;
+                            if (minmea_parse_gsv(&frame, line)) {
+                                printf("GSV: total_sats=%d (msg %d/%d)\n",
+                                       frame.total_sats, frame.msg_nr, frame.total_msgs);
+                            }
+                            break;
+                        }
+                        case MINMEA_INVALID:
+                            break;
+                        default:
+                            printf("NMEA: %s\n", line);
+                            break;
+                    }
                 }
                 line_pos = 0;
             } else if (c != '\r' && line_pos < (int)sizeof(line) - 1) {

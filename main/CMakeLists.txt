@@ -7,6 +7,7 @@ endif()
 idf_component_register(
 	SRCS
 		"main.c"
+		"minmea/minmea.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
@@ -17,6 +18,7 @@ idf_component_register(
 		${extra_requires}
 	INCLUDE_DIRS
 		"."
+		"minmea"
 )
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)
