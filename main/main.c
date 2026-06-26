@@ -285,6 +285,18 @@ static void display_gps_data(void) {
     // Sky plot centred in the right panel
     draw_sky_plot(cx, cy, r);
 
+    // LED 4: red = no fix, amber = 2D fix, green = 3D fix
+    uint32_t led_color;
+    if (!gps_data.has_fix) {
+        led_color = 0xFF0000;
+    } else if (gps_data.fix_type == MINMEA_GPGSA_FIX_3D) {
+        led_color = 0x00CC00;
+    } else {
+        led_color = 0xFFAA00;
+    }
+    bsp_led_set_pixel(4, led_color);
+    bsp_led_send();
+
     blit();
 }
 
