@@ -302,9 +302,10 @@ static void display_gps_data(void) {
 
 static void gps_task(void* arg) {
     uint8_t* buf = malloc(GPS_BUF_SIZE);
-    char      line[256];
-    int       line_pos     = 0;
-    TickType_t last_rmc_tick = 0;
+    char       line[256];
+    int        line_pos      = 0;
+    TickType_t last_rmc_tick  = 0;
+    TickType_t last_nmea_tick = 0;
 
     while (1) {
         int len = uart_read_bytes(GPS_UART_PORT, buf, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -319,6 +320,13 @@ static void gps_task(void* arg) {
             last_rmc_tick = 0;
         }
 
+        // Turn off NMEA activity LED if no sentence received for 2 seconds
+        if (last_nmea_tick != 0 && (xTaskGetTickCount() - last_nmea_tick) > pdMS_TO_TICKS(2000)) {
+            bsp_led_set_pixel(5, 0x000000);
+            bsp_led_send();
+            last_nmea_tick = 0;
+        }
+
         for (int i = 0; i < len; i++) {
             char c = (char)buf[i];
             if (c == '\n') {
@@ -329,6 +337,8 @@ static void gps_task(void* arg) {
                             struct minmea_sentence_rmc frame;
                             if (minmea_parse_rmc(&frame, line)) {
                                 last_rmc_tick        = xTaskGetTickCount();
+                                last_nmea_tick       = last_rmc_tick;
+                                bsp_led_set_pixel(5, 0x003300); // green
                                 gps_data.has_fix     = frame.valid;
                                 gps_data.has_time    = (frame.date.year > 0);
                                 gps_data.time        = frame.time;
@@ -341,13 +351,16 @@ static void gps_task(void* arg) {
                                        frame.time.hours, frame.time.minutes, frame.time.seconds,
                                        frame.valid ? "valid" : "invalid", gps_data.latitude, gps_data.longitude,
                                        gps_data.speed_knots, gps_data.course);
-                                display_gps_data();
+                                display_gps_data(); // also calls bsp_led_send()
                             }
                             break;
                         }
                         case MINMEA_SENTENCE_GGA: {
                             struct minmea_sentence_gga frame;
                             if (minmea_parse_gga(&frame, line)) {
+                                last_nmea_tick          = xTaskGetTickCount();
+                                bsp_led_set_pixel(5, 0x003333); // cyan
+                                bsp_led_send();
                                 gps_data.satellites     = frame.satellites_tracked;
                                 gps_data.altitude       = minmea_tofloat(&frame.altitude);
                                 gps_data.altitude_units = frame.altitude_units;
@@ -359,6 +372,9 @@ static void gps_task(void* arg) {
                         case MINMEA_SENTENCE_GSA: {
                             struct minmea_sentence_gsa frame;
                             if (minmea_parse_gsa(&frame, line)) {
+                                last_nmea_tick    = xTaskGetTickCount();
+                                bsp_led_set_pixel(5, 0x333300); // yellow
+                                bsp_led_send();
                                 gps_data.fix_type = frame.fix_type;
                                 gps_data.hdop     = minmea_tofloat(&frame.hdop);
                                 printf("GSA: fix=%d hdop=%.1f\n", frame.fix_type, gps_data.hdop);
@@ -368,6 +384,9 @@ static void gps_task(void* arg) {
                         case MINMEA_SENTENCE_GSV: {
                             struct minmea_sentence_gsv frame;
                             if (minmea_parse_gsv(&frame, line)) {
+                                last_nmea_tick        = xTaskGetTickCount();
+                                bsp_led_set_pixel(5, 0x330033); // magenta
+                                bsp_led_send();
                                 static sat_info_t gsv_buf[MAX_SATS_IN_VIEW];
                                 static int        gsv_count = 0;
                                 if (frame.msg_nr == 1) {
