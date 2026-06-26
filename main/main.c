@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,19 +10,17 @@
 #include "custom_certificates.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
-#include "minmea.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
 #include "hal/lcd_types.h"
+#include "minmea.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
 #include "pax_text.h"
 #include "pax_types.h"
 #include "portmacro.h"
-#include "wifi_connection.h"
-#include "wifi_remote.h"
 
 // Constants
 static char const TAG[] = "main";
@@ -70,8 +69,91 @@ static void display_message(const char* message) {
 #define GPS_UART_BAUD 9600
 #define GPS_BUF_SIZE  1024
 
+typedef struct {
+    bool               has_fix;
+    bool               has_time;
+    float              latitude;
+    float              longitude;
+    float              altitude;
+    char               altitude_units;
+    float              speed_knots;
+    float              course;
+    int                satellites;
+    int                fix_type;
+    float              hdop;
+    struct minmea_time time;
+    struct minmea_date date;
+} gps_data_t;
+
+static gps_data_t gps_data = {0};
+
+static void display_gps_data(void) {
+    if (pax_buf_get_width(&fb) == 0) return;
+
+    char text[64];
+    pax_background(&fb, BLACK);
+
+    // Row 0 (y=4): title + fix status
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 4, "GPS Receiver");
+    if (gps_data.has_fix) {
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 220, 4, "FIX OK");
+    } else {
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 210, 4, "NO FIX");
+    }
+
+    // Row 1 (y=24): time + date
+    if (gps_data.has_time) {
+        snprintf(text, sizeof(text), "Time: %02d:%02d:%02d UTC", gps_data.time.hours, gps_data.time.minutes,
+                 gps_data.time.seconds);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 24, text);
+        snprintf(text, sizeof(text), "%02d/%02d/%04d", gps_data.date.day, gps_data.date.month, gps_data.date.year);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 210, 24, text);
+    } else {
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 24, "Time: --:--:--");
+    }
+
+    // Rows 2-3 (y=44, y=64): position, or "searching" when no fix
+    if (gps_data.has_fix) {
+        snprintf(text, sizeof(text), "Lat:  %+.6f", gps_data.latitude);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 44, text);
+        snprintf(text, sizeof(text), "Lon: %+.6f", gps_data.longitude);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 64, text);
+    } else {
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 54, "Searching for satellites...");
+    }
+
+    // Row 4 (y=84): altitude + satellite count
+    snprintf(text, sizeof(text), "Alt: %.1f%c   Sats: %d", gps_data.altitude,
+             gps_data.altitude_units ? gps_data.altitude_units : '-', gps_data.satellites);
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 84, text);
+
+    // Row 5 (y=104): speed + course (only meaningful with a fix)
+    if (gps_data.has_fix) {
+        snprintf(text, sizeof(text), "Spd: %.1f kn   Crs: %.1f deg", gps_data.speed_knots, gps_data.course);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 104, text);
+    }
+
+    // Row 6 (y=124): fix type + HDOP
+    const char* fix_str;
+    switch (gps_data.fix_type) {
+        case MINMEA_GPGSA_FIX_2D:
+            fix_str = "2D";
+            break;
+        case MINMEA_GPGSA_FIX_3D:
+            fix_str = "3D";
+            break;
+        default:
+            fix_str = "--";
+            break;
+    }
+    snprintf(text, sizeof(text), "Fix: %s   HDOP: %.1f", fix_str, gps_data.hdop);
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 124, text);
+
+    blit();
+}
+
 static void gps_task(void* arg) {
-    uint8_t* buf      = malloc(GPS_BUF_SIZE);
+    uint8_t* buf = malloc(GPS_BUF_SIZE);
     char     line[256];
     int      line_pos = 0;
 
@@ -86,53 +168,45 @@ static void gps_task(void* arg) {
                         case MINMEA_SENTENCE_RMC: {
                             struct minmea_sentence_rmc frame;
                             if (minmea_parse_rmc(&frame, line)) {
-                                printf("RMC: %02d:%02d:%02d fix=%s lat=%.6f lon=%.6f speed=%.1fkn course=%.1f\n",
+                                gps_data.has_fix     = frame.valid;
+                                gps_data.has_time    = (frame.date.year > 0);
+                                gps_data.time        = frame.time;
+                                gps_data.date        = frame.date;
+                                gps_data.latitude    = minmea_tocoord(&frame.latitude);
+                                gps_data.longitude   = minmea_tocoord(&frame.longitude);
+                                gps_data.speed_knots = minmea_tofloat(&frame.speed);
+                                gps_data.course      = minmea_tofloat(&frame.course);
+                                printf("RMC: %02d:%02d:%02d fix=%s lat=%.6f lon=%.6f spd=%.1f crs=%.1f\n",
                                        frame.time.hours, frame.time.minutes, frame.time.seconds,
-                                       frame.valid ? "valid" : "invalid",
-                                       minmea_tocoord(&frame.latitude),
-                                       minmea_tocoord(&frame.longitude),
-                                       minmea_tofloat(&frame.speed),
-                                       minmea_tofloat(&frame.course));
+                                       frame.valid ? "valid" : "invalid", gps_data.latitude, gps_data.longitude,
+                                       gps_data.speed_knots, gps_data.course);
+                                display_gps_data();
                             }
                             break;
                         }
                         case MINMEA_SENTENCE_GGA: {
                             struct minmea_sentence_gga frame;
                             if (minmea_parse_gga(&frame, line)) {
-                                printf("GGA: %02d:%02d:%02d lat=%.6f lon=%.6f quality=%d sats=%d alt=%.1f%c\n",
-                                       frame.time.hours, frame.time.minutes, frame.time.seconds,
-                                       minmea_tocoord(&frame.latitude),
-                                       minmea_tocoord(&frame.longitude),
-                                       frame.fix_quality,
-                                       frame.satellites_tracked,
-                                       minmea_tofloat(&frame.altitude),
-                                       frame.altitude_units);
+                                gps_data.satellites     = frame.satellites_tracked;
+                                gps_data.altitude       = minmea_tofloat(&frame.altitude);
+                                gps_data.altitude_units = frame.altitude_units;
+                                printf("GGA: sats=%d alt=%.1f%c quality=%d\n", frame.satellites_tracked,
+                                       gps_data.altitude, gps_data.altitude_units, frame.fix_quality);
                             }
                             break;
                         }
                         case MINMEA_SENTENCE_GSA: {
                             struct minmea_sentence_gsa frame;
                             if (minmea_parse_gsa(&frame, line)) {
-                                printf("GSA: fix=%d pdop=%.1f hdop=%.1f vdop=%.1f\n",
-                                       frame.fix_type,
-                                       minmea_tofloat(&frame.pdop),
-                                       minmea_tofloat(&frame.hdop),
-                                       minmea_tofloat(&frame.vdop));
-                            }
-                            break;
-                        }
-                        case MINMEA_SENTENCE_GSV: {
-                            struct minmea_sentence_gsv frame;
-                            if (minmea_parse_gsv(&frame, line)) {
-                                printf("GSV: total_sats=%d (msg %d/%d)\n",
-                                       frame.total_sats, frame.msg_nr, frame.total_msgs);
+                                gps_data.fix_type = frame.fix_type;
+                                gps_data.hdop     = minmea_tofloat(&frame.hdop);
+                                printf("GSA: fix=%d hdop=%.1f\n", frame.fix_type, gps_data.hdop);
                             }
                             break;
                         }
                         case MINMEA_INVALID:
                             break;
                         default:
-                            printf("NMEA: %s\n", line);
                             break;
                     }
                 }
@@ -280,38 +354,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
     // LEDs
-    bsp_led_set_pixel(0, 0xFF0000);  // Red
-    bsp_led_set_pixel(1, 0x00FF00);  // Green
-    bsp_led_set_pixel(2, 0x0000FF);  // Blue
-    bsp_led_set_pixel(3, 0xFFFF00);  // Yellow
-    bsp_led_set_pixel(4, 0x00FFFF);  // Magenta
-    bsp_led_set_pixel(5, 0xFF00FF);  // Cyan
-    bsp_led_send();                  // Send data to the coprocessor
-    bsp_led_set_mode(false);         // Take control over all LEDs by disabling automatic mode
-
-    // Start WiFi stack (if your app does not require WiFi or BLE you can remove this section)
-    pax_background(&fb, BLACK);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Connecting to radio...");
-    blit();
-
-    if (wifi_remote_initialize() == ESP_OK) {
-        display_message("Starting WiFi stack...");
-        wifi_connection_init_stack();  // Start the Espressif WiFi stack
-
-        display_message("Connecting to WiFi network...");
-
-        if (wifi_connect_try_all() == ESP_OK) {
-            display_message("Successfully connected to WiFi network");
-        } else {
-            display_message("Failed to connect to WiFi network");
-        }
-    } else {
-        bsp_power_set_radio_state(BSP_POWER_RADIO_STATE_OFF);
-        ESP_LOGE(TAG, "WiFi radio not responding, WiFi not available");
-        display_message("WiFi radio unavailable");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(500));
+    bsp_led_set_pixel(4, 0x000000);
+    bsp_led_set_pixel(5, 0x000000);
+    bsp_led_send();
+    bsp_led_set_mode(true);
 
     // Main section of the app
 
@@ -325,119 +371,27 @@ void app_main(void) {
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
+
+    display_gps_data();
+
     ESP_ERROR_CHECK(uart_param_config(GPS_UART_PORT, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(GPS_UART_PORT, gpio_gps_rx, gpio_gps_tx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(GPS_UART_PORT, GPS_BUF_SIZE * 2, 0, 0, NULL, 0));
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
 
-    // This example shows how to read from the BSP event queue to read input events
-
-    // If you want to run something at an interval in this same main thread you can replace portMAX_DELAY with an amount
-    // of ticks to wait, for example pdMS_TO_TICKS(1000)
-
-    display_message("Welcome! Press any key to trigger an event.");
-
     while (1) {
         bsp_input_event_t event;
         if (xQueueReceive(input_event_queue, &event, portMAX_DELAY) == pdTRUE) {
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_KEYBOARD: {
-                    if (event.args_keyboard.ascii != '\b' ||
-                        event.args_keyboard.ascii != '\t') {  // Ignore backspace & tab keyboard events
-                        if (pax_buf_get_height(&fb) <= 128) {
-                            char text[64];
-                            snprintf(text, sizeof(text), "%c %s M=%02" PRIx32, event.args_keyboard.ascii,
-                                     event.args_keyboard.utf8, event.args_keyboard.modifiers);
-                            display_message(text);
-                        } else {
-                            ESP_LOGI(TAG, "Keyboard event %c (%02x) %s", event.args_keyboard.ascii,
-                                     (uint8_t)event.args_keyboard.ascii, event.args_keyboard.utf8);
-                            if (pax_buf_get_width(&fb) > 0) {
-                                pax_simple_rect(&fb, BLACK, 0, 0, pax_buf_get_width(&fb), 72);
-                                pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Keyboard event");
-                                char text[64];
-                                snprintf(text, sizeof(text), "ASCII:     %c (0x%02x)", event.args_keyboard.ascii,
-                                         (uint8_t)event.args_keyboard.ascii);
-                                pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 18, text);
-                                snprintf(text, sizeof(text), "UTF-8:     %s", event.args_keyboard.utf8);
-                                pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 36, text);
-                                snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_keyboard.modifiers);
-                                pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 54, text);
-                                blit();
-                            }
-                        }
-                    }
-                    break;
+            if (event.type == INPUT_EVENT_TYPE_NAVIGATION) {
+                if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
+                    bsp_device_restart_to_launcher();
                 }
-                case INPUT_EVENT_TYPE_NAVIGATION: {
-                    ESP_LOGI(TAG, "Navigation event %0" PRIX32 ": %s", (uint32_t)event.args_navigation.key,
-                             event.args_navigation.state ? "pressed" : "released");
-
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
-                        bsp_device_restart_to_launcher();
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
-                        bsp_input_set_backlight_brightness(0);
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F3) {
-                        bsp_input_set_backlight_brightness(100);
-                    }
-
-                    if (pax_buf_get_height(&fb) <= 128) {
-                        char text[64];
-                        snprintf(text, sizeof(text), "%02" PRIx32 " %s M=%02" PRIx32,
-                                 (uint32_t)event.args_navigation.key, event.args_navigation.state ? "P" : "R",
-                                 event.args_navigation.modifiers);
-                        display_message(text);
-                    } else {
-                        pax_simple_rect(&fb, BLACK, 0, 100, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 100 + 0, "Navigation event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "Key:       0x%0" PRIX32, (uint32_t)event.args_navigation.key);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 100 + 18, text);
-                        snprintf(text, sizeof(text), "State:     %s",
-                                 event.args_navigation.state ? "pressed" : "released");
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 100 + 36, text);
-                        snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_navigation.modifiers);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 100 + 54, text);
-                        blit();
-                    }
-                    break;
+                if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
+                    bsp_input_set_backlight_brightness(0);
                 }
-                case INPUT_EVENT_TYPE_ACTION: {
-                    ESP_LOGI(TAG, "Action event 0x%0" PRIX32 ": %s", (uint32_t)event.args_action.type,
-                             event.args_action.state ? "yes" : "no");
-                    if (pax_buf_get_height(&fb) <= 128) {
-                        char text[64];
-                        snprintf(text, sizeof(text), "%02" PRIx32 " %s" PRIx32, (uint32_t)event.args_action.type,
-                                 event.args_action.state ? "Y" : "N");
-                        display_message(text);
-                    } else {
-                        pax_simple_rect(&fb, BLACK, 0, 200 + 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 200 + 0, "Action event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "Type:      0x%0" PRIX32, (uint32_t)event.args_action.type);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 200 + 36, text);
-                        snprintf(text, sizeof(text), "State:     %s", event.args_action.state ? "yes" : "no");
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 200 + 54, text);
-                        blit();
-                    }
-                    break;
+                if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F3) {
+                    bsp_input_set_backlight_brightness(100);
                 }
-                case INPUT_EVENT_TYPE_SCANCODE: {
-                    ESP_LOGI(TAG, "Scancode event 0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    if (pax_buf_get_width(&fb) > 0) {
-                        pax_simple_rect(&fb, BLACK, 0, 300 + 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 300 + 0, "Scancode event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "Scancode:  0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 300 + 36, text);
-                        blit();
-                    }
-                    break;
-                }
-                default:
-                    break;
             }
         }
     }
