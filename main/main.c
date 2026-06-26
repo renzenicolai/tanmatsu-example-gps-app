@@ -302,11 +302,23 @@ static void display_gps_data(void) {
 
 static void gps_task(void* arg) {
     uint8_t* buf = malloc(GPS_BUF_SIZE);
-    char     line[256];
-    int      line_pos = 0;
+    char      line[256];
+    int       line_pos     = 0;
+    TickType_t last_rmc_tick = 0;
 
     while (1) {
         int len = uart_read_bytes(GPS_UART_PORT, buf, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+
+        // Clear fix status if no RMC sentence received for 2 seconds
+        if (last_rmc_tick != 0 && (xTaskGetTickCount() - last_rmc_tick) > pdMS_TO_TICKS(2000)) {
+            if (gps_data.has_fix) {
+                gps_data.has_fix = false;
+                ESP_LOGW(TAG, "GPS data timeout, fix lost");
+                display_gps_data();
+            }
+            last_rmc_tick = 0;
+        }
+
         for (int i = 0; i < len; i++) {
             char c = (char)buf[i];
             if (c == '\n') {
@@ -316,6 +328,7 @@ static void gps_task(void* arg) {
                         case MINMEA_SENTENCE_RMC: {
                             struct minmea_sentence_rmc frame;
                             if (minmea_parse_rmc(&frame, line)) {
+                                last_rmc_tick        = xTaskGetTickCount();
                                 gps_data.has_fix     = frame.valid;
                                 gps_data.has_time    = (frame.date.year > 0);
                                 gps_data.time        = frame.time;
