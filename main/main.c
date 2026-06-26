@@ -1,4 +1,6 @@
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -6,6 +8,7 @@
 #include "bsp/power.h"
 #include "custom_certificates.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
@@ -59,6 +62,32 @@ static void display_message(const char* message) {
         blit();
     } else {
         ESP_LOGI(TAG, "Message: %s", message);
+    }
+}
+
+#define GPS_UART_PORT UART_NUM_1
+#define GPS_UART_BAUD 9600
+#define GPS_BUF_SIZE  1024
+
+static void gps_task(void* arg) {
+    uint8_t* buf     = malloc(GPS_BUF_SIZE);
+    char     line[256];
+    int      line_pos = 0;
+
+    while (1) {
+        int len = uart_read_bytes(GPS_UART_PORT, buf, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        for (int i = 0; i < len; i++) {
+            char c = (char)buf[i];
+            if (c == '\n') {
+                line[line_pos] = '\0';
+                if (line_pos > 0) {
+                    printf("%s\n", line);
+                }
+                line_pos = 0;
+            } else if (c != '\r' && line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
     }
 }
 
@@ -232,6 +261,21 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // Main section of the app
+
+    gpio_num_t gpio_gps_rx = 32;  // RX pin of GPS module, TX from ESP32-P4
+    gpio_num_t gpio_gps_tx = 33;  // TX pin of GPS module, RX from ESP32-P4
+
+    const uart_config_t uart_config = {
+        .baud_rate = GPS_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(GPS_UART_PORT, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(GPS_UART_PORT, gpio_gps_rx, gpio_gps_tx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(GPS_UART_PORT, GPS_BUF_SIZE * 2, 0, 0, NULL, 0));
+    xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
 
     // This example shows how to read from the BSP event queue to read input events
 
