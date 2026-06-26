@@ -1,7 +1,9 @@
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -69,6 +71,16 @@ static void display_message(const char* message) {
 #define GPS_UART_BAUD 9600
 #define GPS_BUF_SIZE  1024
 
+#define MAX_SATS_IN_VIEW 32
+#define DEG2RAD          (3.14159265f / 180.0f)
+
+typedef struct {
+    int   prn;
+    int   elevation;
+    int   azimuth;
+    float snr;
+} sat_info_t;
+
 typedef struct {
     bool               has_fix;
     bool               has_time;
@@ -83,71 +95,103 @@ typedef struct {
     float              hdop;
     struct minmea_time time;
     struct minmea_date date;
+    sat_info_t         sats[MAX_SATS_IN_VIEW];
+    int                sat_count;
 } gps_data_t;
 
 static gps_data_t gps_data = {0};
 
+// Sky plot: center (cx,cy), radius r. North=up, azimuth clockwise.
+static void draw_sky_plot(float cx, float cy, float r) {
+    // Elevation rings at 30° and 60° (dim)
+    pax_outline_circle(&fb, 0xFF404040, cx, cy, r * 2.0f / 3.0f);
+    pax_outline_circle(&fb, 0xFF404040, cx, cy, r / 3.0f);
+    // Crosshairs (dim)
+    pax_simple_line(&fb, 0xFF404040, cx - r, cy, cx + r, cy);
+    pax_simple_line(&fb, 0xFF404040, cx, cy - r, cx, cy + r);
+    // Horizon circle
+    pax_outline_circle(&fb, WHITE, cx, cy, r);
+    // Cardinal labels
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - 3.0f,  cy - r - 11.0f, "N");
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - 3.0f,  cy + r + 2.0f,  "S");
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx + r + 2.0f, cy - 4.5f,   "E");
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, cx - r - 8.0f, cy - 4.5f,   "W");
+    // Satellite dots + PRN labels
+    for (int i = 0; i < gps_data.sat_count; i++) {
+        sat_info_t* s      = &gps_data.sats[i];
+        float       az     = s->azimuth * DEG2RAD;
+        float       plot_r = r * (1.0f - (float)s->elevation / 90.0f);
+        float       sx     = cx + plot_r * sinf(az);
+        float       sy     = cy - plot_r * cosf(az);
+        pax_draw_circle(&fb, WHITE, sx, sy, 3.5f);
+        char prn_str[5];
+        snprintf(prn_str, sizeof(prn_str), "%d", s->prn);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 9, sx + 4.5f, sy - 4.5f, prn_str);
+    }
+}
+
 static void display_gps_data(void) {
     if (pax_buf_get_width(&fb) == 0) return;
 
-    char text[64];
+    char text[32];
     pax_background(&fb, BLACK);
 
-    // Row 0 (y=4): title + fix status
+    // Left column: text info (fits within ~175 px)
     pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 4, "GPS Receiver");
     if (gps_data.has_fix) {
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 220, 4, "FIX OK");
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 22, "FIX OK");
     } else {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 210, 4, "NO FIX");
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 22, "NO FIX");
     }
 
-    // Row 1 (y=24): time + date
     if (gps_data.has_time) {
-        snprintf(text, sizeof(text), "Time: %02d:%02d:%02d UTC", gps_data.time.hours, gps_data.time.minutes,
-                 gps_data.time.seconds);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 24, text);
-        snprintf(text, sizeof(text), "%02d/%02d/%04d", gps_data.date.day, gps_data.date.month, gps_data.date.year);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 210, 24, text);
+        snprintf(text, sizeof(text), "%02d:%02d:%02d UTC",
+                 gps_data.time.hours, gps_data.time.minutes, gps_data.time.seconds);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, text);
+        snprintf(text, sizeof(text), "%02d/%02d/%04d",
+                 gps_data.date.day, gps_data.date.month, gps_data.date.year);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 58, text);
     } else {
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 24, "Time: --:--:--");
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 40, "--:--:--");
     }
 
-    // Rows 2-3 (y=44, y=64): position, or "searching" when no fix
     if (gps_data.has_fix) {
-        snprintf(text, sizeof(text), "Lat:  %+.6f", gps_data.latitude);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 44, text);
-        snprintf(text, sizeof(text), "Lon: %+.6f", gps_data.longitude);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 64, text);
+        snprintf(text, sizeof(text), "Lat:%+.6f", gps_data.latitude);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 76, text);
+        snprintf(text, sizeof(text), "Lon:%+.6f", gps_data.longitude);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 94, text);
     } else {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 54, "Searching for satellites...");
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 0, 76, "No position fix");
     }
 
-    // Row 4 (y=84): altitude + satellite count
-    snprintf(text, sizeof(text), "Alt: %.1f%c   Sats: %d", gps_data.altitude,
-             gps_data.altitude_units ? gps_data.altitude_units : '-', gps_data.satellites);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 84, text);
+    snprintf(text, sizeof(text), "Alt:%.1f%c",
+             gps_data.altitude, gps_data.altitude_units ? gps_data.altitude_units : 'm');
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 112, text);
 
-    // Row 5 (y=104): speed + course (only meaningful with a fix)
+    snprintf(text, sizeof(text), "Sats:%d", gps_data.satellites);
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 130, text);
+
     if (gps_data.has_fix) {
-        snprintf(text, sizeof(text), "Spd: %.1f kn   Crs: %.1f deg", gps_data.speed_knots, gps_data.course);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 104, text);
+        snprintf(text, sizeof(text), "Spd:%.1fkn", gps_data.speed_knots);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 148, text);
+        snprintf(text, sizeof(text), "Crs:%.1fdeg", gps_data.course);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 166, text);
     }
 
-    // Row 6 (y=124): fix type + HDOP
     const char* fix_str;
     switch (gps_data.fix_type) {
-        case MINMEA_GPGSA_FIX_2D:
-            fix_str = "2D";
-            break;
-        case MINMEA_GPGSA_FIX_3D:
-            fix_str = "3D";
-            break;
-        default:
-            fix_str = "--";
-            break;
+        case MINMEA_GPGSA_FIX_2D: fix_str = "2D"; break;
+        case MINMEA_GPGSA_FIX_3D: fix_str = "3D"; break;
+        default:                  fix_str = "--"; break;
     }
-    snprintf(text, sizeof(text), "Fix: %s   HDOP: %.1f", fix_str, gps_data.hdop);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 124, text);
+    snprintf(text, sizeof(text), "Fix:%s HDOP:%.1f", fix_str, gps_data.hdop);
+    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 184, text);
+
+    // Vertical divider
+    pax_simple_line(&fb, 0xFF404040, 175.0f, 0.0f, 175.0f, (float)pax_buf_get_height(&fb));
+
+    // Sky plot: right half, vertically centred
+    draw_sky_plot(252.0f, 120.0f, 62.0f);
 
     blit();
 }
@@ -201,6 +245,31 @@ static void gps_task(void* arg) {
                                 gps_data.fix_type = frame.fix_type;
                                 gps_data.hdop     = minmea_tofloat(&frame.hdop);
                                 printf("GSA: fix=%d hdop=%.1f\n", frame.fix_type, gps_data.hdop);
+                            }
+                            break;
+                        }
+                        case MINMEA_SENTENCE_GSV: {
+                            struct minmea_sentence_gsv frame;
+                            if (minmea_parse_gsv(&frame, line)) {
+                                static sat_info_t gsv_buf[MAX_SATS_IN_VIEW];
+                                static int        gsv_count = 0;
+                                if (frame.msg_nr == 1) {
+                                    gsv_count = 0;
+                                }
+                                for (int i = 0; i < 4 && gsv_count < MAX_SATS_IN_VIEW; i++) {
+                                    if (frame.sats[i].nr > 0) {
+                                        gsv_buf[gsv_count].prn       = frame.sats[i].nr;
+                                        gsv_buf[gsv_count].elevation = frame.sats[i].elevation;
+                                        gsv_buf[gsv_count].azimuth   = frame.sats[i].azimuth;
+                                        gsv_buf[gsv_count].snr       = minmea_tofloat(&frame.sats[i].snr);
+                                        gsv_count++;
+                                    }
+                                }
+                                if (frame.msg_nr == frame.total_msgs) {
+                                    memcpy(gps_data.sats, gsv_buf, gsv_count * sizeof(sat_info_t));
+                                    gps_data.sat_count = gsv_count;
+                                    printf("GSV: %d sats in view\n", gsv_count);
+                                }
                             }
                             break;
                         }
