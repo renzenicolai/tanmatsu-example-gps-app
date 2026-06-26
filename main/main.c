@@ -188,7 +188,8 @@ static void display_gps_data(void) {
 
     pax_draw_text(&fb, 0xFF777777, pax_font_sky_mono, lfs, lx, y, "Date");
     if (gps_data.has_time) {
-        snprintf(text, sizeof(text), "%02d / %02d / %04d", gps_data.date.day, gps_data.date.month, gps_data.date.year);
+        int year = gps_data.date.year < 100 ? gps_data.date.year + 2000 : gps_data.date.year;
+        snprintf(text, sizeof(text), "%02d / %02d / %04d", gps_data.date.day, gps_data.date.month, year);
     } else {
         snprintf(text, sizeof(text), "--/--/----");
     }
